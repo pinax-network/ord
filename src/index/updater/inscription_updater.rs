@@ -413,6 +413,14 @@ impl InscriptionUpdater<'_, '_> {
             old_location: old_satpoint,
             sequence_number,
           })?;
+
+          if op_return && index.firehose {
+            sender.blocking_send(Event::InscriptionBurned {
+              block_height: self.height,
+              inscription_id,
+              sequence_number,
+            })?;
+          }
         }
 
         (false, sequence_number)

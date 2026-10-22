@@ -2867,6 +2867,23 @@ mod tests {
     });
     context.mine_blocks(1);
 
+    // burn: the inscription's sat goes to an OP_RETURN output
+    context.core.broadcast_tx(TransactionTemplate {
+      inputs: &[(3, 1, 0, Default::default())],
+      op_return: Some(
+        script::Builder::new()
+          .push_opcode(opcodes::all::OP_RETURN)
+          .into_script(),
+      ),
+      op_return_index: Some(0),
+      op_return_value: Some(1),
+      outputs: 1,
+      // pays for the OP_RETURN output's sat, mockcore adds its value on top
+      fee: 1,
+      ..default()
+    });
+    context.mine_blocks(1);
+
     let (_, rune_id) = context.etch(
       Runestone {
         etching: Some(Etching {
@@ -2907,6 +2924,7 @@ mod tests {
         !matches!(
           event,
           Event::InscriptionRevealed { .. }
+            | Event::InscriptionBurned { .. }
             | Event::RuneEntryCreated { .. }
             | Event::BlockIndexed { .. }
         )
@@ -2933,6 +2951,11 @@ mod tests {
       fee: 1000,
       inscription_id,
       inscription_number: 0,
+      sequence_number: 0,
+    }));
+    assert!(firehose_events.contains(&Event::InscriptionBurned {
+      block_height: 4,
+      inscription_id,
       sequence_number: 0,
     }));
     assert!(firehose_events.iter().any(|event| matches!(

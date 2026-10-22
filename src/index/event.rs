@@ -50,6 +50,13 @@ pub enum Event {
     inscription_number: i32,
     sequence_number: u32,
   },
+  /// Sent right after `InscriptionTransferred` when the inscription was moved to an OP_RETURN
+  /// output, which sets its burned charm.
+  InscriptionBurned {
+    block_height: u32,
+    inscription_id: InscriptionId,
+    sequence_number: u32,
+  },
   /// Sent right after `RuneEtched`, with the new rune's entry.
   RuneEntryCreated {
     block_height: u32,
