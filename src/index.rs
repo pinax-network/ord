@@ -2941,6 +2941,7 @@ mod tests {
     assert!(firehose_events.contains(&Event::InscriptionRevealed {
       block_height: 2,
       details: InscriptionDetails {
+        body: Some("hello".into()),
         content_length: Some(5),
         content_type: Some("text/plain;charset=utf-8".into()),
         // ord hides brc-20 inscriptions

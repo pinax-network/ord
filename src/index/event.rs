@@ -71,21 +71,32 @@ pub enum Event {
   },
 }
 
+/// What an inscription's envelope declared: decoded fields, and the raw ones they come from.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct InscriptionDetails {
+  /// The content as inscribed (still encoded with `content_encoding`)
+  pub body: Option<Vec<u8>>,
   pub content_encoding: Option<String>,
   pub content_length: Option<usize>,
   pub content_type: Option<String>,
   pub delegate: Option<InscriptionId>,
   pub gallery: bool,
   pub hidden: bool,
+  /// Raw CBOR
+  pub metadata: Option<Vec<u8>>,
   pub metaprotocol: Option<String>,
   pub pointer: Option<u64>,
+  /// Raw CBOR, encoded with `property_encoding`: title, traits, gallery
+  pub properties: Option<Vec<u8>>,
+  pub property_encoding: Option<Vec<u8>>,
+  /// The rune commitment the envelope carries for an etching
+  pub rune: Option<Vec<u8>>,
 }
 
 impl InscriptionDetails {
   pub(crate) fn from_inscription(inscription: &Inscription) -> Self {
     Self {
+      body: inscription.body.clone(),
       content_encoding: inscription
         .content_encoding()
         .and_then(|encoding| encoding.to_str().ok().map(str::to_string)),
@@ -94,8 +105,12 @@ impl InscriptionDetails {
       delegate: inscription.delegate(),
       gallery: !inscription.properties().gallery.is_empty(),
       hidden: inscription.hidden(),
+      metadata: inscription.metadata.clone(),
       metaprotocol: inscription.metaprotocol().map(str::to_string),
       pointer: inscription.pointer(),
+      properties: inscription.properties.clone(),
+      property_encoding: inscription.property_encoding.clone(),
+      rune: inscription.rune.clone(),
     }
   }
 }
