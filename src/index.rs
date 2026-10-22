@@ -4,7 +4,7 @@ use {
       Entry, HeaderValue, InscriptionEntry, InscriptionEntryValue, InscriptionIdValue,
       OutPointValue, RuneEntryValue, RuneIdValue, SatPointValue, SatRange, TxidValue,
     },
-    event::Event,
+    event::{Event, InscriptionDetails},
     lot::Lot,
     reorg::Reorg,
     updater::Updater,
@@ -195,11 +195,29 @@ impl<T> BitcoinCoreRpcResultExt<T> for Result<T, bitcoincore_rpc::Error> {
   }
 }
 
+/// An output spent by a block's input, as Firehose delivers it with the block.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Prevout {
+  /// The height of the block that created the output.
+  pub height: u32,
+  pub txout: TxOut,
+}
+
+/// A final block from a Firehose stream, with the outputs its inputs spend.
+#[derive(Debug, Clone)]
+pub struct FirehoseBlock {
+  pub block: Block,
+  pub height: u32,
+  pub prevouts: HashMap<OutPoint, Prevout>,
+}
+
 pub struct Index {
   pub(crate) client: Client,
   database: Database,
   durability: redb::Durability,
   event_sender: Option<tokio::sync::mpsc::Sender<Event>>,
+  /// Blocks come from Firehose instead of bitcoind, which is never called.
+  pub(crate) firehose: bool,
   genesis_block_coinbase_transaction: Transaction,
   genesis_block_coinbase_txid: Txid,
   height_limit: Option<u32>,
@@ -225,7 +243,25 @@ impl Index {
     event_sender: Option<tokio::sync::mpsc::Sender<Event>>,
   ) -> Result<Self> {
     let client = settings.bitcoin_rpc_client(None)?;
+    Self::open_with_client(settings, event_sender, client, false)
+  }
 
+  /// Opens an index fed by [`Index::index_firehose_blocks`]. Bitcoind is never contacted: the
+  /// RPC client is never connected, so any call to it fails.
+  pub fn open_firehose(
+    settings: &Settings,
+    event_sender: Option<tokio::sync::mpsc::Sender<Event>>,
+  ) -> Result<Self> {
+    let client = Client::new(&settings.bitcoin_rpc_url(None), bitcoincore_rpc::Auth::None)?;
+    Self::open_with_client(settings, event_sender, client, true)
+  }
+
+  fn open_with_client(
+    settings: &Settings,
+    event_sender: Option<tokio::sync::mpsc::Sender<Event>>,
+    client: Client,
+    firehose: bool,
+  ) -> Result<Self> {
     let path = settings.index().to_owned();
 
     let data_dir = path.parent().unwrap();
@@ -460,6 +496,7 @@ impl Index {
       database,
       durability,
       event_sender,
+      firehose,
       first_index_height,
       genesis_block_coinbase_transaction,
       height_limit: settings.height_limit(),
@@ -701,6 +738,70 @@ impl Index {
         }
       }
     }
+  }
+
+  /// Indexes final blocks from a Firehose stream until the channel closes. An empty index
+  /// starts at the first block's height, which must not be past the first height it indexes.
+  pub fn index_firehose_blocks(&self, blocks: std::sync::mpsc::Receiver<FirehoseBlock>) -> Result {
+    ensure!(
+      self.firehose,
+      "index was not opened with `Index::open_firehose`"
+    );
+
+    let (tx, rx) = std::sync::mpsc::sync_channel(32);
+
+    thread::spawn(move || {
+      for FirehoseBlock {
+        block,
+        height,
+        prevouts,
+      } in blocks
+      {
+        let mut block = updater::BlockData::from(block);
+        block.firehose_height = Some(height);
+        block.prevouts = Some(prevouts);
+        if tx.send(block).is_err() {
+          break;
+        }
+      }
+    });
+
+    let wtx = self.begin_write()?;
+
+    let mut updater = Updater {
+      height: wtx
+        .open_table(HEIGHT_TO_BLOCK_HEADER)?
+        .range(0..)?
+        .next_back()
+        .transpose()?
+        .map(|(height, _header)| height.value() + 1)
+        .unwrap_or(0),
+      index: self,
+      outputs_cached: 0,
+      outputs_traversed: 0,
+      sat_ranges_since_flush: 0,
+    };
+
+    updater.update_index_from_firehose(wtx, rx)
+  }
+
+  /// The next height to index: one past the last indexed block, or 0 for an empty index.
+  pub fn next_height(&self) -> Result<u32> {
+    Ok(
+      self
+        .begin_read()?
+        .0
+        .open_table(HEIGHT_TO_BLOCK_HEADER)?
+        .range(0..)?
+        .next_back()
+        .transpose()?
+        .map(|(height, _header)| height.value() + 1)
+        .unwrap_or(0),
+    )
+  }
+
+  pub fn first_index_height(&self) -> u32 {
+    self.first_index_height
   }
 
   pub fn export(&self, filename: &String, include_addresses: bool) -> Result {
@@ -2656,6 +2757,247 @@ impl Index {
 #[cfg(test)]
 mod tests {
   use {super::*, crate::index::testing::Context};
+
+  fn firehose_blocks(core: &mockcore::Handle, from: usize) -> Vec<FirehoseBlock> {
+    let state = core.state();
+
+    state
+      .hashes
+      .iter()
+      .enumerate()
+      .skip(from)
+      .map(|(height, hash)| {
+        let block = state.blocks[hash].clone();
+
+        let mut prevouts = HashMap::new();
+        for tx in &block.txdata {
+          for input in &tx.input {
+            let outpoint = input.previous_output;
+            if outpoint.is_null() {
+              continue;
+            }
+            prevouts.insert(
+              outpoint,
+              Prevout {
+                height: state.txid_to_block_height[&outpoint.txid],
+                txout: state.transactions[&outpoint.txid].output[outpoint.vout.into_usize()]
+                  .clone(),
+              },
+            );
+          }
+        }
+
+        FirehoseBlock {
+          block,
+          height: height.try_into().unwrap(),
+          prevouts,
+        }
+      })
+      .collect()
+  }
+
+  fn open_firehose_index(
+    context: &Context,
+    event_sender: tokio::sync::mpsc::Sender<Event>,
+  ) -> (Index, TempDir) {
+    let tempdir = TempDir::new().unwrap();
+
+    let options = Options::try_parse_from([
+      "ord",
+      "--bitcoin-rpc-url",
+      "127.0.0.1:1",
+      "--datadir",
+      tempdir.path().to_str().unwrap(),
+      "--chain=regtest",
+      "--index-runes",
+    ])
+    .unwrap();
+
+    let index = Index::open_firehose(
+      &Settings::from_options(options).or_defaults().unwrap(),
+      Some(event_sender),
+    )
+    .unwrap();
+
+    assert_eq!(index.next_height().unwrap(), 0);
+    let _ = context;
+
+    (index, tempdir)
+  }
+
+  fn drain(receiver: &mut tokio::sync::mpsc::Receiver<Event>) -> Vec<Event> {
+    let mut events = Vec::new();
+    while let Ok(event) = receiver.try_recv() {
+      events.push(event);
+    }
+    events
+  }
+
+  // Indexing blocks with their prevouts from Firehose must give the same events and state as
+  // indexing them from bitcoind, without calling it.
+  #[test]
+  fn firehose_blocks_index_like_bitcoind() {
+    let (event_sender, mut event_receiver) = tokio::sync::mpsc::channel(4096);
+    let context = Context::builder()
+      .arg("--index-runes")
+      .event_sender(event_sender)
+      .build();
+
+    context.mine_blocks(1);
+
+    let inscription = Inscription {
+      content_type: Some("text/plain;charset=utf-8".into()),
+      body: Some("hello".into()),
+      metaprotocol: Some("brc-20".into()),
+      ..default()
+    };
+    let create_txid = context.core.broadcast_tx(TransactionTemplate {
+      inputs: &[(1, 0, 0, inscription.to_witness())],
+      fee: 1000,
+      outputs: 1,
+      ..default()
+    });
+    context.mine_blocks(1);
+
+    context.core.broadcast_tx(TransactionTemplate {
+      inputs: &[(2, 1, 0, Default::default())],
+      fee: 0,
+      outputs: 1,
+      ..default()
+    });
+    context.mine_blocks(1);
+
+    let (_, rune_id) = context.etch(
+      Runestone {
+        etching: Some(Etching {
+          rune: Some(Rune(99246114928149462)),
+          divisibility: Some(2),
+          symbol: Some('$'),
+          terms: Some(Terms {
+            amount: Some(1000),
+            cap: Some(100),
+            ..default()
+          }),
+          premine: Some(5000),
+          ..default()
+        }),
+        ..default()
+      },
+      1,
+    );
+
+    let bitcoind_events = drain(&mut event_receiver);
+
+    let (firehose_sender, mut firehose_receiver) = tokio::sync::mpsc::channel(4096);
+    let (firehose_index, _tempdir) = open_firehose_index(&context, firehose_sender);
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    for block in firehose_blocks(&context.core, 0) {
+      tx.send(block).unwrap();
+    }
+    drop(tx);
+    firehose_index.index_firehose_blocks(rx).unwrap();
+
+    let firehose_events = drain(&mut firehose_receiver);
+
+    // Firehose mode adds InscriptionRevealed, RuneEntryCreated and BlockIndexed; the rest match
+    let shared_events = firehose_events
+      .iter()
+      .filter(|event| {
+        !matches!(
+          event,
+          Event::InscriptionRevealed { .. }
+            | Event::RuneEntryCreated { .. }
+            | Event::BlockIndexed { .. }
+        )
+      })
+      .cloned()
+      .collect::<Vec<Event>>();
+    assert!(!bitcoind_events.is_empty());
+    pretty_assert_eq!(bitcoind_events, shared_events);
+
+    let inscription_id = InscriptionId {
+      txid: create_txid,
+      index: 0,
+    };
+    assert!(firehose_events.contains(&Event::InscriptionRevealed {
+      block_height: 2,
+      details: InscriptionDetails {
+        content_length: Some(5),
+        content_type: Some("text/plain;charset=utf-8".into()),
+        // ord hides brc-20 inscriptions
+        hidden: true,
+        metaprotocol: Some("brc-20".into()),
+        ..default()
+      },
+      fee: 1000,
+      inscription_id,
+      inscription_number: 0,
+      sequence_number: 0,
+    }));
+    assert!(firehose_events.iter().any(|event| matches!(
+      event,
+      Event::RuneEntryCreated { rune_id: id, entry, .. }
+        if *id == rune_id && entry.divisibility == 2 && entry.premine == 5000
+    )));
+    assert_eq!(
+      firehose_events
+        .iter()
+        .filter(|event| matches!(event, Event::BlockIndexed { .. }))
+        .count(),
+      context.core.state().hashes.len()
+    );
+
+    pretty_assert_eq!(
+      firehose_index.runes().unwrap(),
+      context.index.runes().unwrap()
+    );
+    pretty_assert_eq!(
+      firehose_index.get_rune_balances().unwrap(),
+      context.index.get_rune_balances().unwrap()
+    );
+    assert_eq!(
+      firehose_index.next_height().unwrap(),
+      context.index.next_height().unwrap()
+    );
+  }
+
+  // Firehose blocks resume where the index left off, and anything else is refused.
+  #[test]
+  fn firehose_blocks_must_follow_the_index() {
+    let (event_sender, _event_receiver) = tokio::sync::mpsc::channel(4096);
+    let context = Context::builder().arg("--index-runes").build();
+    context.mine_blocks(3);
+
+    let (firehose_index, _tempdir) = open_firehose_index(&context, event_sender);
+    let blocks = firehose_blocks(&context.core, 0);
+
+    // an empty index can't start past its first indexed height, here 0
+    let (tx, rx) = std::sync::mpsc::channel();
+    tx.send(blocks[2].clone()).unwrap();
+    drop(tx);
+    assert!(firehose_index.index_firehose_blocks(rx).is_err());
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    tx.send(blocks[0].clone()).unwrap();
+    tx.send(blocks[1].clone()).unwrap();
+    drop(tx);
+    firehose_index.index_firehose_blocks(rx).unwrap();
+    assert_eq!(firehose_index.next_height().unwrap(), 2);
+
+    // resuming must continue at the next height
+    let (tx, rx) = std::sync::mpsc::channel();
+    tx.send(blocks[3].clone()).unwrap();
+    drop(tx);
+    assert!(firehose_index.index_firehose_blocks(rx).is_err());
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    tx.send(blocks[2].clone()).unwrap();
+    tx.send(blocks[3].clone()).unwrap();
+    drop(tx);
+    firehose_index.index_firehose_blocks(rx).unwrap();
+    assert_eq!(firehose_index.next_height().unwrap(), 4);
+  }
 
   #[test]
   fn height_limit() {

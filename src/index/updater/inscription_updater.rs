@@ -24,6 +24,7 @@ pub(super) struct Flotsam {
 enum Origin {
   New {
     cursed: bool,
+    details: InscriptionDetails,
     fee: u64,
     gallery: bool,
     hidden: bool,
@@ -201,6 +202,7 @@ impl InscriptionUpdater<'_, '_> {
           offset,
           origin: Origin::New {
             cursed: curse.is_some() && !jubilant,
+            details: InscriptionDetails::from_inscription(&inscription.payload),
             fee: 0,
             gallery: !inscription.payload.properties().gallery.is_empty(),
             hidden: inscription.payload.hidden(),
@@ -417,6 +419,7 @@ impl InscriptionUpdater<'_, '_> {
       }
       Origin::New {
         cursed,
+        details,
         fee,
         gallery,
         hidden,
@@ -540,6 +543,20 @@ impl InscriptionUpdater<'_, '_> {
             inscription_id,
             location: (!unbound).then_some(new_satpoint),
             parent_inscription_ids,
+            sequence_number,
+          })?;
+        }
+
+        // Firehose readers get what the envelope declared, ord's own consumers don't need it
+        if let Some(ref sender) = index.event_sender
+          && index.firehose
+        {
+          sender.blocking_send(Event::InscriptionRevealed {
+            block_height: self.height,
+            details,
+            fee,
+            inscription_id,
+            inscription_number,
             sequence_number,
           })?;
         }

@@ -5,11 +5,13 @@ pub(super) struct RuneUpdater<'a, 'tx, 'client> {
   pub(super) burned: HashMap<RuneId, Lot>,
   pub(super) client: &'client Client,
   pub(super) event_sender: Option<&'a mpsc::Sender<Event>>,
+  pub(super) firehose: bool,
   pub(super) height: u32,
   pub(super) id_to_entry: &'a mut Table<'tx, RuneIdValue, RuneEntryValue>,
   pub(super) inscription_id_to_sequence_number: &'a Table<'tx, InscriptionIdValue, u32>,
   pub(super) minimum: Rune,
   pub(super) outpoint_to_balances: &'a mut Table<'tx, &'static OutPointValue, &'static [u8]>,
+  pub(super) prevouts: Option<&'a HashMap<OutPoint, Prevout>>,
   pub(super) rune_to_id: &'a mut Table<'tx, u128, RuneIdValue>,
   pub(super) runes: u64,
   pub(super) sequence_number_to_rune_id: &'a mut Table<'tx, u32, RuneIdValue>,
@@ -314,6 +316,15 @@ impl RuneUpdater<'_, '_, '_> {
         txid,
         rune_id: id,
       })?;
+
+      if self.firehose {
+        sender.blocking_send(Event::RuneEntryCreated {
+          block_height: self.height,
+          entry,
+          rune_id: id,
+          txid,
+        })?;
+      }
     }
 
     let inscription_id = InscriptionId { txid, index: 0 };
@@ -424,30 +435,47 @@ impl RuneUpdater<'_, '_, '_> {
           continue;
         }
 
-        let Some(tx_info) = self
-          .client
-          .get_raw_transaction_info_ext(input.previous_output.txid)?
-        else {
-          panic!(
-            "can't get input transaction: {}",
-            input.previous_output.txid
-          );
-        };
+        let (taproot, commit_tx_height) = if let Some(prevouts) = self.prevouts {
+          let Some(prevout) = prevouts.get(&input.previous_output) else {
+            bail!("block has no prevout for {}", input.previous_output);
+          };
 
-        let taproot = tx_info.hex.output[input.previous_output.vout.into_usize()]
-          .script_pubkey
-          .is_p2tr();
+          (
+            prevout.txout.script_pubkey.is_p2tr(),
+            prevout.height.into_usize(),
+          )
+        } else {
+          let Some(tx_info) = self
+            .client
+            .get_raw_transaction_info_ext(input.previous_output.txid)?
+          else {
+            panic!(
+              "can't get input transaction: {}",
+              input.previous_output.txid
+            );
+          };
+
+          let taproot = tx_info.hex.output[input.previous_output.vout.into_usize()]
+            .script_pubkey
+            .is_p2tr();
+
+          if !taproot {
+            continue;
+          }
+
+          let commit_tx_height = self
+            .client
+            .get_block_header_info(&tx_info.blockhash.unwrap())
+            .into_option()?
+            .unwrap()
+            .height;
+
+          (taproot, commit_tx_height)
+        };
 
         if !taproot {
           continue;
         }
-
-        let commit_tx_height = self
-          .client
-          .get_block_header_info(&tx_info.blockhash.unwrap())
-          .into_option()?
-          .unwrap()
-          .height;
 
         let confirmations = self
           .height

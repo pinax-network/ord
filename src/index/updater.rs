@@ -12,14 +12,21 @@ mod inscription_updater;
 mod rune_updater;
 
 pub(crate) struct BlockData {
+  /// The height of a block from Firehose, which may start an empty index past height 0.
+  pub(crate) firehose_height: Option<u32>,
   pub(crate) header: Header,
+  /// The outputs this block's inputs spend, when the block comes from Firehose instead of
+  /// bitcoind; they replace the fetcher.
+  pub(crate) prevouts: Option<HashMap<OutPoint, Prevout>>,
   pub(crate) txdata: Vec<(Transaction, Txid)>,
 }
 
 impl From<Block> for BlockData {
   fn from(block: Block) -> Self {
     BlockData {
+      firehose_height: None,
       header: block.header,
+      prevouts: None,
       txdata: block
         .txdata
         .into_iter()
@@ -41,9 +48,40 @@ pub(crate) struct Updater<'index> {
 }
 
 impl Updater<'_> {
-  pub(crate) fn update_index(&mut self, mut wtx: WriteTransaction) -> Result {
-    let start = Instant::now();
+  pub(crate) fn update_index(&mut self, wtx: WriteTransaction) -> Result {
     let starting_height = u32::try_from(self.index.client.get_block_count()?).unwrap() + 1;
+    let rx = Self::fetch_blocks_from(self.index, self.height)?;
+    let (output_sender, txout_receiver) = Self::spawn_fetcher(self.index)?;
+    self.index_blocks(
+      wtx,
+      rx,
+      output_sender,
+      txout_receiver,
+      Some(starting_height),
+    )
+  }
+
+  /// Indexes blocks from a Firehose stream, which carry the outputs their inputs spend, so
+  /// nothing is fetched from bitcoind. Blocks must be final: a reorg is an error.
+  pub(crate) fn update_index_from_firehose(
+    &mut self,
+    wtx: WriteTransaction,
+    rx: std::sync::mpsc::Receiver<BlockData>,
+  ) -> Result {
+    let (output_sender, _) = mpsc::channel::<OutPoint>(1);
+    let (_, txout_receiver) = broadcast::channel::<TxOut>(1);
+    self.index_blocks(wtx, rx, output_sender, txout_receiver, None)
+  }
+
+  fn index_blocks(
+    &mut self,
+    mut wtx: WriteTransaction,
+    rx: std::sync::mpsc::Receiver<BlockData>,
+    mut output_sender: mpsc::Sender<OutPoint>,
+    mut txout_receiver: broadcast::Receiver<TxOut>,
+    starting_height: Option<u32>,
+  ) -> Result {
+    let start = Instant::now();
     let starting_index_height = self.height;
 
     wtx
@@ -56,28 +94,36 @@ impl Updater<'_> {
           .unwrap_or(0),
       )?;
 
-    let mut progress_bar = if cfg!(test)
-      || log_enabled!(log::Level::Info)
-      || starting_height <= self.height
-      || self.index.settings.integration_test()
+    let mut progress_bar = if let Some(starting_height) = starting_height
+      && !(cfg!(test)
+        || log_enabled!(log::Level::Info)
+        || starting_height <= self.height
+        || self.index.settings.integration_test())
     {
-      None
-    } else {
       let progress_bar = ProgressBar::new(starting_height.into());
       progress_bar.set_position(self.height.into());
       progress_bar.set_style(
         ProgressStyle::with_template("[indexing blocks] {wide_bar} {pos}/{len}").unwrap(),
       );
       Some(progress_bar)
+    } else {
+      None
     };
-
-    let rx = Self::fetch_blocks_from(self.index, self.height)?;
-
-    let (mut output_sender, mut txout_receiver) = Self::spawn_fetcher(self.index)?;
 
     let mut uncommitted = 0;
     let mut utxo_cache = HashMap::new();
     while let Ok(block) = rx.recv() {
+      if let Some(height) = block.firehose_height
+        && height != self.height
+      {
+        ensure!(
+          starting_index_height == 0 && self.height == 0 && height <= self.index.first_index_height,
+          "firehose block {height} does not follow indexed height {}",
+          self.height
+        );
+        self.height = height;
+      }
+
       self.index_block(
         &mut output_sender,
         &mut txout_receiver,
@@ -363,6 +409,7 @@ impl Updater<'_> {
 
       let mut rune_updater = RuneUpdater {
         event_sender: self.index.event_sender.as_ref(),
+        firehose: self.index.firehose,
         block_time: block.header.time,
         burned: HashMap::new(),
         client: &self.index.client,
@@ -374,6 +421,7 @@ impl Updater<'_> {
           Height(self.height),
         ),
         outpoint_to_balances: &mut outpoint_to_rune_balances,
+        prevouts: block.prevouts.as_ref(),
         rune_to_id: &mut rune_to_rune_id,
         runes,
         sequence_number_to_rune_id: &mut sequence_number_to_rune_id,
@@ -389,6 +437,15 @@ impl Updater<'_> {
     }
 
     height_to_block_header.insert(&self.height, &block.header.store())?;
+
+    if let Some(sender) = self.index.event_sender.as_ref()
+      && self.index.firehose
+    {
+      sender.blocking_send(Event::BlockIndexed {
+        block_hash: block.header.block_hash(),
+        block_height: self.height,
+      })?;
+    }
 
     self.height += 1;
     self.outputs_traversed += outputs_in_block;
@@ -435,15 +492,16 @@ impl Updater<'_> {
       && self.index.index_inscriptions;
 
     // If the receiver still has inputs something went wrong in the last
-    // block and we shouldn't recover from this and commit the last block
-    if index_inscriptions {
+    // block and we shouldn't recover from this and commit the last block.
+    // Firehose blocks carry their inputs and don't use the receiver.
+    if index_inscriptions && block.prevouts.is_none() {
       assert!(
         matches!(txout_receiver.try_recv(), Err(TryRecvError::Empty)),
         "Previous block did not consume all inputs"
       );
     }
 
-    if !self.index.have_full_utxo_index() {
+    if !self.index.have_full_utxo_index() && block.prevouts.is_none() {
       // Send all missing input outpoints to be fetched
       let txids = block
         .txdata
@@ -573,12 +631,19 @@ impl Updater<'_> {
               entry.value().to_buf()
             } else {
               assert!(!self.index.have_full_utxo_index());
-              let txout = txout_receiver.blocking_recv().map_err(|err| {
-                anyhow!(
-                  "failed to get transaction for {}: {err}",
-                  input.previous_output
-                )
-              })?;
+              let txout = if let Some(prevouts) = &block.prevouts {
+                prevouts
+                  .get(&input.previous_output)
+                  .map(|prevout| prevout.txout.clone())
+                  .ok_or_else(|| anyhow!("block has no prevout for {}", input.previous_output))?
+              } else {
+                txout_receiver.blocking_recv().map_err(|err| {
+                  anyhow!(
+                    "failed to get transaction for {}: {err}",
+                    input.previous_output
+                  )
+                })?
+              };
 
               let mut entry = UtxoEntryBuf::new();
               entry.push_value(txout.value.to_sat(), self.index);

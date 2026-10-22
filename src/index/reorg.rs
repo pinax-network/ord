@@ -28,6 +28,10 @@ impl Reorg {
     match index.block_hash(height.checked_sub(1))? {
       Some(index_prev_blockhash) if index_prev_blockhash == bitcoind_prev_blockhash => Ok(()),
       Some(index_prev_blockhash) if index_prev_blockhash != bitcoind_prev_blockhash => {
+        if index.firehose {
+          return Err(anyhow!(reorg::Error::Unrecoverable));
+        }
+
         let savepoint_interval = u32::try_from(index.settings.savepoint_interval()).unwrap();
         let max_savepoints = u32::try_from(index.settings.max_savepoints()).unwrap();
         let max_recoverable_reorg_depth =
@@ -77,7 +81,8 @@ impl Reorg {
   }
 
   pub(crate) fn is_savepoint_required(index: &Index, height: u32) -> Result<bool> {
-    if let redb::Durability::None = index.durability {
+    // Firehose blocks are final, there is nothing to roll back to
+    if matches!(index.durability, redb::Durability::None) || index.firehose {
       return Ok(false);
     }
 
