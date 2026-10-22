@@ -740,8 +740,10 @@ impl Index {
     }
   }
 
-  /// Indexes final blocks from a Firehose stream until the channel closes. An empty index
-  /// starts at the first block's height, which must not be past the first height it indexes.
+  /// Indexes final blocks from a Firehose stream until the channel closes, or until
+  /// `shut_down` is called: then it commits what it indexed and returns, even while waiting
+  /// for the next block. An empty index starts at the first block's height, which must not be
+  /// past the first height it indexes.
   pub fn index_firehose_blocks(&self, blocks: std::sync::mpsc::Receiver<FirehoseBlock>) -> Result {
     ensure!(
       self.firehose,
@@ -751,12 +753,21 @@ impl Index {
     let (tx, rx) = std::sync::mpsc::sync_channel(32);
 
     thread::spawn(move || {
-      for FirehoseBlock {
-        block,
-        height,
-        prevouts,
-      } in blocks
-      {
+      loop {
+        let FirehoseBlock {
+          block,
+          height,
+          prevouts,
+        } = match blocks.recv_timeout(Duration::from_millis(100)) {
+          Ok(block) => block,
+          Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            if SHUTTING_DOWN.load(atomic::Ordering::Relaxed) {
+              break;
+            }
+            continue;
+          }
+          Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+        };
         let mut block = updater::BlockData::from(block);
         block.firehose_height = Some(height);
         block.prevouts = Some(prevouts);
