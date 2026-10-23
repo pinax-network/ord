@@ -57,6 +57,16 @@ pub enum Event {
     inscription_id: InscriptionId,
     sequence_number: u32,
   },
+  /// Firehose only: a transaction spent an output holding a rune balance. Sent for each rune of
+  /// each such input, before the transaction's `RuneTransferred` and `RuneBurned`; with them
+  /// every rune move has a debit and a credit side.
+  RuneSpent {
+    amount: u128,
+    block_height: u32,
+    outpoint: OutPoint,
+    rune_id: RuneId,
+    txid: Txid,
+  },
   /// Sent right after `RuneEtched`, with the new rune's entry.
   RuneEntryCreated {
     block_height: u32,

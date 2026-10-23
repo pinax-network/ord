@@ -2895,7 +2895,7 @@ mod tests {
     });
     context.mine_blocks(1);
 
-    let (_, rune_id) = context.etch(
+    let (etch_txid, rune_id) = context.etch(
       Runestone {
         etching: Some(Etching {
           rune: Some(Rune(99246114928149462)),
@@ -2913,6 +2913,19 @@ mod tests {
       },
       1,
     );
+
+    // spend the premine: a RuneSpent from the etching's output, then a RuneTransferred
+    let spend_txid = context.core.broadcast_tx(TransactionTemplate {
+      inputs: &[(
+        usize::try_from(rune_id.block).unwrap(),
+        1,
+        0,
+        Witness::new(),
+      )],
+      outputs: 1,
+      ..default()
+    });
+    context.mine_blocks(1);
 
     let bitcoind_events = drain(&mut event_receiver);
 
@@ -2937,6 +2950,7 @@ mod tests {
           Event::InscriptionRevealed { .. }
             | Event::InscriptionBurned { .. }
             | Event::RuneEntryCreated { .. }
+            | Event::RuneSpent { .. }
             | Event::BlockIndexed { .. }
         )
       })
@@ -2975,6 +2989,18 @@ mod tests {
       Event::RuneEntryCreated { rune_id: id, entry, .. }
         if *id == rune_id && entry.divisibility == 2 && entry.premine == 5000
     )));
+    let spent = firehose_events
+      .iter()
+      .filter(|event| matches!(event, Event::RuneSpent { .. }))
+      .collect::<Vec<&Event>>();
+    assert!(
+      matches!(
+        spent[..],
+        [Event::RuneSpent { amount: 5000, outpoint, rune_id: id, txid, .. }]
+          if outpoint.txid == etch_txid && *id == rune_id && *txid == spend_txid
+      ),
+      "{spent:?}"
+    );
     assert_eq!(
       firehose_events
         .iter()

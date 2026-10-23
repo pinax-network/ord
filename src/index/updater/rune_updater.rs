@@ -23,7 +23,7 @@ impl RuneUpdater<'_, '_, '_> {
   pub(super) fn index_runes(&mut self, tx_index: u32, tx: &Transaction, txid: Txid) -> Result<()> {
     let artifact = Runestone::decipher(tx);
 
-    let mut unallocated = self.unallocated(tx)?;
+    let mut unallocated = self.unallocated(tx, txid)?;
 
     let mut allocated: Vec<HashMap<RuneId, Lot>> = vec![HashMap::new(); tx.output.len()];
 
@@ -492,7 +492,7 @@ impl RuneUpdater<'_, '_, '_> {
     Ok(false)
   }
 
-  fn unallocated(&mut self, tx: &Transaction) -> Result<HashMap<RuneId, Lot>> {
+  fn unallocated(&mut self, tx: &Transaction, txid: Txid) -> Result<HashMap<RuneId, Lot>> {
     // map of rune ID to un-allocated balance of that rune
     let mut unallocated: HashMap<RuneId, Lot> = HashMap::new();
 
@@ -508,6 +508,18 @@ impl RuneUpdater<'_, '_, '_> {
           let ((id, balance), len) = Index::decode_rune_balance(&buffer[i..]).unwrap();
           i += len;
           *unallocated.entry(id).or_default() += balance;
+
+          if self.firehose
+            && let Some(sender) = self.event_sender
+          {
+            sender.blocking_send(Event::RuneSpent {
+              amount: balance,
+              block_height: self.height,
+              outpoint: input.previous_output,
+              rune_id: id,
+              txid,
+            })?;
+          }
         }
       }
     }
